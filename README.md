@@ -3,6 +3,8 @@
 COBOL ソースの `IF / EVALUATE / PERFORM / SEARCH` の入れ子構造を Excel 上で可視化する、単機能・軽量な VBA ツールです。
 **外部依存ゼロ**（Excel + VBA のみ、PowerShell / .NET 不要）。
 
+![sample output](docs/sample.png)
+
 ## 何ができる
 
 | シート | 内容 |
