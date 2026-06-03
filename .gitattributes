@@ -1,0 +1,8 @@
+* text=auto
+*.bas text eol=crlf
+*.cls text eol=crlf
+*.frm text eol=crlf
+*.cbl text
+*.cob text
+*.cpy text
+*.md  text

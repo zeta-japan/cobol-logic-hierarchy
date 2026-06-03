@@ -1,0 +1,19 @@
+# Excel
+*.xlsm
+*.xlsx
+*.xls
+~$*
+*.tmp
+
+# OS
+Thumbs.db
+.DS_Store
+desktop.ini
+
+# Editor
+.vscode/
+.idea/
+
+# Temporary
+*.bak
+*.swp
