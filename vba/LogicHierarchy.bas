@@ -264,7 +264,7 @@ Private Sub BuildTree(ByRef lines() As String, ByRef errCount As Long)
                 errCount = errCount + 1
                 Do While ctrl.Count > 0: ctrl.Remove ctrl.Count: Loop
             End If
-            curC = AddNode(code, "SECTION", CStr(srcLineNo), -1)
+            curC = AddNode(Application.WorksheetFunction.Trim(code), "SECTION", CStr(srcLineNo), -1)
             GoTo NextLine
         End If
 
@@ -473,12 +473,17 @@ End Function
 
 ' --- 段落/SECTION ヘッダ判定 (ピリオド付き原文で呼ぶ) ---
 Private Function IsParagraphHeader(ByVal raw As String, ByVal code As String) As Boolean
-    Dim col As Long: col = FirstNonSpaceCol(raw, CODE_START)
-    If col < CODE_START Or col > 11 Then Exit Function
     Dim u As String: u = UCase(Trim(code))
     If Right(u, 1) <> "." Then Exit Function
-    Dim t As String: t = FirstToken(u)
-    If Right(t, 1) = "." Then t = Left(t, Len(t) - 1)
+    Dim body As String: body = Trim(Left(u, Len(u) - 1))   ' ピリオド除去
+    ' SECTION ヘッダは列位置に依存せず内容で判定 (環境/桁ズレに強い)
+    If body = "SECTION" Or Right(body, 8) = " SECTION" Then
+        IsParagraphHeader = True: Exit Function
+    End If
+    ' 段落 (bare name) は Area A (8～11桁) 始まりのみ
+    Dim col As Long: col = FirstNonSpaceCol(raw, CODE_START)
+    If col < CODE_START Or col > 11 Then Exit Function
+    Dim t As String: t = FirstToken(body)
     Select Case t
         Case "IF", "ELSE", "END-IF", "EVALUATE", "WHEN", "END-EVALUATE", _
              "PERFORM", "END-PERFORM", "SEARCH", "END-SEARCH", "MOVE", "CALL", _
