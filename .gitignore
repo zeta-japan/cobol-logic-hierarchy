@@ -17,3 +17,6 @@ desktop.ini
 # Temporary
 *.bak
 *.swp
+
+# Editing source (UTF-8 working copy; vba/*.bas is the published CP932 build)
+dev/
