@@ -2,11 +2,16 @@ Attribute VB_Name = "LogicHierarchy"
 Option Explicit
 
 ' ============================================================
-'  COBOL ロジック階層 (hand-simple / vba0526版アルゴリズム準拠)
+'  COBOL ロジック階層 (実行順ツリー / call-order inline 展開)
 '   - シート: コントロール / COBOLソース / ロジック階層 の 3 枚
 '   - PROCEDURE DIVISION 以降だけ解析
 '   - PM 流: 行末ピリオドを先に剥がしてから keyword 判定
-'   - IF→[THEN]/[ELSE]、EVALUATE→WHEN、SEARCH→[AT END]/WHEN を分岐ノード化
+'   - SECTION 下に段落、段落下に文 をネスト (PERFORM 展開の単位になる)
+'   - ロジック階層: entry セクションから PERFORM を辿り、呼出先を
+'     その場でインライン展開して右へ伸ばす (実行順ツリー)
+'       * 同一セクションが複数箇所で PERFORM されたら各々展開 (重複)
+'       * 再帰/循環 (展開中パス上に再登場) は停止して「(再帰)」表示
+'       * entry から未到達のセクションは末尾にまとめて追記
 '   - 罫線ツリー ├── / └── / │  (ChrW で生成)
 '   - 開始行は COBOLソース シートへハイパーリンク
 '   - スタック検査で END-xx/ELSE/WHEN の対応ミスを赤表示
@@ -20,10 +25,16 @@ Private Const CODE_END   As Long = 72
 Private Const C_HEADER  As Long = 14474460   ' RGB(220,220,220)
 Private Const C_SECTION As Long = 13168895   ' RGB(255,240,200)
 Private Const C_BRANCH  As Long = 16314338   ' RGB(226,239,248)
+Private Const C_WARN    As Long = 10284031   ' RGB(255,235,156)
+Private Const CALL_ROW_CAP As Long = 20000   ' 出力暴走防止 (重複展開の上限)
 
 ' ノード木 (フラット + 親インデックス)
 Private nText() As String, nKind() As String, nLine() As String
 Private nParent() As Long, nDepth() As Long, nCount As Long
+
+' 実行順ツリー描画用
+Private secMap As Collection   ' セクション/段落 名(UCASE) → ノード index
+Private mEmitted As Long       ' 出力行カウンタ (CALL_ROW_CAP 用)
 
 ' ============================================================
 '  (1) コントロールシート (Meiryo UI + teal 角丸ボタン)
@@ -53,7 +64,7 @@ Public Sub SetupControlSheet()
     ws.Rows("2:3").RowHeight = 24
 
     With ws.Range("B4:H4"): .Merge: .HorizontalAlignment = xlLeft: .IndentLevel = 1: End With
-    ws.Range("B4").Value = "PROCEDURE DIVISION の IF/EVALUATE/PERFORM/SEARCH 階層を可視化"
+    ws.Range("B4").Value = "PERFORM の呼出順に沿ってロジックを右へ展開 (実行順ツリー)"
     With ws.Range("B4").Font: .Name = "Meiryo UI": .Size = 10: .Color = cMute: End With
     ws.Rows("4").RowHeight = 22
 
@@ -190,32 +201,32 @@ Private Sub BuildSourceSheet(ByRef lines() As String, ByVal cblPath As String)
 End Sub
 
 ' ============================================================
-'  (5) ロジック階層 シート
+'  (5) ロジック階層 シート (実行順ツリー)
 ' ============================================================
 Private Sub BuildHierarchySheet(ByRef lines() As String, ByVal cblPath As String)
     Dim errCount As Long: BuildTree lines, errCount
     Dim ws As Worksheet: Set ws = EnsureSheet(SH_TREE)
     ws.Cells.Clear
-    ws.Range("A1").Value = "COBOL ロジック階層"
+    ws.Range("A1").Value = "COBOL ロジック階層 (実行順ツリー)"
     ws.Range("A1").Font.Bold = True: ws.Range("A1").Font.Size = 14
     ws.Range("A3").Value = "対象ファイル": ws.Range("B3").Value = cblPath
     ws.Range("A4").Value = "総行数":       ws.Range("B4").Value = UBound(lines) - LBound(lines) + 1
     ws.Range("A5").Value = "検出した問題": ws.Range("B5").Value = errCount & " 件"
     If errCount > 0 Then ws.Range("B5").Font.Color = RGB(192, 0, 0)
     Dim hdr As Long: hdr = 7
-    ws.Cells(hdr, 1).Value = "階層ツリー": ws.Cells(hdr, 2).Value = "開始行": ws.Cells(hdr, 3).Value = "種別"
+    ws.Cells(hdr, 1).Value = "実行順ツリー": ws.Cells(hdr, 2).Value = "開始行": ws.Cells(hdr, 3).Value = "種別"
     ws.Range(ws.Cells(hdr, 1), ws.Cells(hdr, 3)).Font.Bold = True
     ws.Range(ws.Cells(hdr, 1), ws.Cells(hdr, 3)).Interior.Color = C_HEADER
     Application.ScreenUpdating = False
-    RenderTree ws, hdr + 1
-    ws.Columns("A").ColumnWidth = 80: ws.Columns("B").ColumnWidth = 8: ws.Columns("C").ColumnWidth = 14
+    RenderCallTree ws, hdr + 1
+    ws.Columns("A").ColumnWidth = 90: ws.Columns("B").ColumnWidth = 8: ws.Columns("C").ColumnWidth = 14
     Application.ScreenUpdating = True
     ws.Activate: ws.Range("A1").Select
     MsgBox "解析完了。 検出した問題: " & errCount & " 件", _
         IIf(errCount > 0, vbExclamation, vbInformation)
 End Sub
 
-' --- ソース → ノード木 ---
+' --- ソース → ノード木 (SECTION 下に段落、段落下に文をネスト) ---
 Private Sub BuildTree(ByRef lines() As String, ByRef errCount As Long)
     nCount = 0
     ReDim nText(1 To 256): ReDim nKind(1 To 256): ReDim nLine(1 To 256)
@@ -224,9 +235,12 @@ Private Sub BuildTree(ByRef lines() As String, ByRef errCount As Long)
     Dim ctrl As New Collection
     Dim curC As Long: curC = -1
     Dim inProc As Boolean
+    Dim procNode As Long: procNode = -1
+    Dim curSection As Long: curSection = -1
     Dim i As Long, raw As String, ind As String, code As String, cu As String, kind As String
-    Dim srcLineNo As Long, newIdx As Long, brIdx As Long, isHdr As Boolean
+    Dim srcLineNo As Long, newIdx As Long, brIdx As Long
     Dim pendingIfNode As Long, wasPending As Long
+    Dim hk As String, hp As Long
 
     For i = LBound(lines) To UBound(lines)
         srcLineNo = i - LBound(lines) + 1
@@ -248,23 +262,32 @@ Private Sub BuildTree(ByRef lines() As String, ByRef errCount As Long)
             cu = UCase(code)
             If InStr(cu, "PROCEDURE") > 0 And InStr(cu, "DIVISION") > 0 Then
                 inProc = True
-                curC = AddNode("PROCEDURE DIVISION", "SECTION", CStr(srcLineNo), -1)
+                procNode = AddNode("PROCEDURE DIVISION", "SECTION", CStr(srcLineNo), -1)
+                curC = procNode
+                curSection = procNode
             End If
             GoTo NextLine
         End If
 
-        ' 段落/SECTION ヘッダ判定は ピリオド付きの原文で
-        isHdr = IsParagraphHeader(raw, code)
+        ' ヘッダ判定は ピリオド付きの原文で → SECTION / PARA / "" (非ヘッダ)
+        hk = HeaderKind(raw, code)
         ' PM 流: keyword 判定前にピリオド剥がし
         If Right(code, 1) = "." Then code = Trim(Left(code, Len(code) - 1))
 
-        If isHdr Then
+        If hk <> "" Then
             If ctrl.Count > 0 Then
                 AddNode "!! 前段落の階層が " & ctrl.Count & " 残存 (END-xxx 不足?)", "ERROR", CStr(srcLineNo), curC
                 errCount = errCount + 1
                 Do While ctrl.Count > 0: ctrl.Remove ctrl.Count: Loop
             End If
-            curC = AddNode(Application.WorksheetFunction.Trim(code), "SECTION", CStr(srcLineNo), -1)
+            If hk = "SECTION" Then
+                hp = procNode: If hp = 0 Then hp = -1
+                curSection = AddNode(Application.WorksheetFunction.Trim(code), "SECTION", CStr(srcLineNo), hp)
+                curC = curSection
+            Else   ' PARA
+                hp = curSection: If hp = 0 Then hp = -1
+                curC = AddNode(Application.WorksheetFunction.Trim(code), "PARA", CStr(srcLineNo), hp)
+            End If
             GoTo NextLine
         End If
 
@@ -358,60 +381,183 @@ Private Function AddNode(ByVal text As String, ByVal kind As String, _
     AddNode = nCount
 End Function
 
-' --- ツリー描画 + 開始行ハイパーリンク ---
-Private Sub RenderTree(ByVal ws As Worksheet, ByVal startRow As Long)
+' ============================================================
+'  実行順ツリー描画
+' ============================================================
+Private Sub RenderCallTree(ByVal ws As Worksheet, ByVal startRow As Long)
     If nCount = 0 Then Exit Sub
-    Dim lastChild() As Long: ReDim lastChild(-1 To nCount)
-    Dim i As Long
-    For i = 1 To nCount: lastChild(nParent(i)) = i: Next i
-    Dim r As Long: r = startRow
-    Dim disp As String, sl As Long
+    mEmitted = 0
+
+    ' セクション/段落 名 → index マップ (重複名は最初優先)
+    Set secMap = New Collection
+    Dim i As Long, nm As String
     For i = 1 To nCount
-        If nKind(i) = "SECTION" Then
-            disp = ChrW(&H25A0) & " " & nText(i)
-        Else
-            disp = BuildPrefix(i, lastChild) & nText(i)
+        If nKind(i) = "SECTION" Or nKind(i) = "PARA" Then
+            nm = UCase(FirstToken(nText(i)))
+            If nm <> "PROCEDURE" Then
+                On Error Resume Next
+                secMap.Add i, nm
+                On Error GoTo 0
+            End If
         End If
-        ws.Cells(r, 1).Value = disp
-        ws.Cells(r, 1).Font.Name = "MS Gothic"
-        If Len(nLine(i)) > 0 Then
-            sl = CLng(nLine(i))
-            On Error Resume Next
-            ws.Hyperlinks.Add Anchor:=ws.Cells(r, 2), Address:="", _
-                SubAddress:="'" & SH_SRC & "'!A" & (sl + 3), _
-                TextToDisplay:=CStr(sl)
-            If Err.Number <> 0 Then ws.Cells(r, 2).Value = sl: Err.Clear
-            On Error GoTo 0
-        End If
-        ws.Cells(r, 3).Value = KindLabel(nKind(i))
-        ApplyRowColor ws, r, nKind(i)
-        r = r + 1
     Next i
+
+    Dim visited() As Boolean: ReDim visited(1 To nCount)
+    Dim r As Long: r = startRow
+    Dim pathStack As New Collection
+
+    ' PROCEDURE DIVISION ノードを探す
+    Dim procIdx As Long: procIdx = 0
+    For i = 1 To nCount
+        If nText(i) = "PROCEDURE DIVISION" Then procIdx = i: Exit For
+    Next i
+
+    If procIdx > 0 Then
+        EmitRow ws, r, ChrW(&H25A0) & " " & nText(procIdx), nLine(procIdx), "SECTION"
+        r = r + 1
+        ' entry = procNode の最初の子 (主処理)
+        Dim entry As Long: entry = 0
+        For i = 1 To nCount
+            If nParent(i) = procIdx Then entry = i: Exit For
+        Next i
+        If entry > 0 Then
+            visited(entry) = True
+            RenderRec entry, "", True, pathStack, r, ws, visited
+        End If
+        ' entry から未到達のトップレベルセクションを末尾に追記
+        Dim firstUn As Boolean: firstUn = True
+        For i = 1 To nCount
+            If nParent(i) = procIdx And Not visited(i) Then
+                If firstUn Then
+                    EmitRow ws, r, "── (entry から未到達のセクション) ──", "", "ERROR"
+                    r = r + 1: firstUn = False
+                End If
+                visited(i) = True
+                RenderRec i, "", True, pathStack, r, ws, visited
+            End If
+        Next i
+    Else
+        ' フォールバック: PROCEDURE DIVISION 無し → 全ルートを順に
+        For i = 1 To nCount
+            If nParent(i) = -1 Then RenderRec i, "", True, pathStack, r, ws, visited
+        Next i
+    End If
 End Sub
 
-Private Function BuildPrefix(ByVal idx As Long, ByRef lastChild() As Long) As String
-    Dim chain() As Long: ReDim chain(1 To 128)
-    Dim cnt As Long, a As Long: a = nParent(idx)
-    Do While a <> -1
-        If nParent(a) <> -1 Then cnt = cnt + 1: chain(cnt) = a
-        a = nParent(a)
-    Loop
-    Dim s As String, j As Long, node As Long
-    For j = cnt To 1 Step -1
-        node = chain(j)
-        If lastChild(nParent(node)) = node Then s = s & "    " Else s = s & ChrW(&H2502) & "   "
-    Next j
-    If lastChild(nParent(idx)) = idx Then
-        s = s & ChrW(&H2514) & ChrW(&H2500) & " "
-    Else
-        s = s & ChrW(&H251C) & ChrW(&H2500) & " "
+' --- ノード idx とその部分木を描画 (PERFORM はインライン展開) ---
+Private Sub RenderRec(ByVal idx As Long, ByVal prefix As String, ByVal isLast As Boolean, _
+                      ByRef pathStack As Collection, ByRef r As Long, ByVal ws As Worksheet, _
+                      ByRef visited() As Boolean)
+    mEmitted = mEmitted + 1
+    If mEmitted = CALL_ROW_CAP + 1 Then
+        EmitRow ws, r, "... (出力上限 " & CALL_ROW_CAP & " 行に達したため打ち切り) ...", "", "ERROR"
+        r = r + 1
     End If
-    BuildPrefix = s
+    If mEmitted > CALL_ROW_CAP Then Exit Sub
+
+    Dim conn As String, childPre As String
+    If isLast Then
+        conn = ChrW(&H2514) & ChrW(&H2500) & " "          ' └─
+        childPre = prefix & "    "
+    Else
+        conn = ChrW(&H251C) & ChrW(&H2500) & " "          ' ├─
+        childPre = prefix & ChrW(&H2502) & "   "           ' │
+    End If
+
+    Dim label As String
+    If nKind(idx) = "SECTION" Or nKind(idx) = "PARA" Then
+        label = ChrW(&H25A0) & " " & nText(idx)            ' ■ name
+    Else
+        label = nText(idx)
+    End If
+    EmitRow ws, r, prefix & conn & label, nLine(idx), nKind(idx)
+    r = r + 1
+
+    ' out-of-line PERFORM → 呼出先をインライン展開
+    Dim tgt As String: tgt = PerformTarget(nText(idx), nKind(idx))
+    If Len(tgt) > 0 Then
+        Dim tIdx As Long: tIdx = MapGet(tgt)
+        If tIdx > 0 Then
+            If OnPath(pathStack, tgt) Then
+                EmitRow ws, r, childPre & ChrW(&H2514) & ChrW(&H2500) & " (再帰: " & tgt & " 展開済)", "", "CYCLE"
+                r = r + 1
+            Else
+                visited(tIdx) = True
+                pathStack.Add UCase(tgt)
+                RenderChildren tIdx, childPre, pathStack, r, ws, visited
+                pathStack.Remove pathStack.Count
+            End If
+            Exit Sub   ' PERFORM ノードは通常子を持たない
+        End If
+    End If
+
+    RenderChildren idx, childPre, pathStack, r, ws, visited
+End Sub
+
+' --- idx の子ノードを順に描画 ---
+Private Sub RenderChildren(ByVal idx As Long, ByVal childPre As String, ByRef pathStack As Collection, _
+                           ByRef r As Long, ByVal ws As Worksheet, ByRef visited() As Boolean)
+    Dim kids() As Long, kc As Long: kc = 0
+    ReDim kids(1 To nCount)
+    Dim j As Long
+    For j = 1 To nCount
+        If nParent(j) = idx Then kc = kc + 1: kids(kc) = j
+    Next j
+    Dim m As Long
+    For m = 1 To kc
+        RenderRec kids(m), childPre, (m = kc), pathStack, r, ws, visited
+    Next m
+End Sub
+
+' --- out-of-line PERFORM の対象名を返す (なければ "") ---
+Private Function PerformTarget(ByVal text As String, ByVal kind As String) As String
+    If kind <> "ACTION" Then Exit Function
+    Dim u As String: u = UCase(Trim(text))
+    If Left(u, 8) <> "PERFORM " Then Exit Function
+    Dim rest As String: rest = Trim(Mid(u, 9))
+    Dim t As String: t = FirstToken(rest)
+    Select Case t
+        Case "UNTIL", "VARYING", "WITH", "FOREVER", "TEST": Exit Function
+    End Select
+    If IsNumeric(t) Then Exit Function
+    PerformTarget = t   ' 注: "PERFORM X THRU Y" は X を返す (近似)
 End Function
+
+Private Function MapGet(ByVal nm As String) As Long
+    On Error Resume Next
+    MapGet = secMap(UCase(nm))
+    On Error GoTo 0
+End Function
+
+Private Function OnPath(ByRef st As Collection, ByVal nm As String) As Boolean
+    Dim v As Variant, u As String: u = UCase(nm)
+    For Each v In st
+        If v = u Then OnPath = True: Exit Function
+    Next v
+End Function
+
+' --- 1 行出力 (ハイパーリンク + 色) ---
+Private Sub EmitRow(ByVal ws As Worksheet, ByVal r As Long, ByVal text As String, _
+                    ByVal lineNo As String, ByVal kind As String)
+    ws.Cells(r, 1).Value = text
+    ws.Cells(r, 1).Font.Name = "MS Gothic"
+    If Len(lineNo) > 0 Then
+        Dim sl As Long: sl = CLng(lineNo)
+        On Error Resume Next
+        ws.Hyperlinks.Add Anchor:=ws.Cells(r, 2), Address:="", _
+            SubAddress:="'" & SH_SRC & "'!A" & (sl + 3), TextToDisplay:=CStr(sl)
+        If Err.Number <> 0 Then ws.Cells(r, 2).Value = sl: Err.Clear
+        On Error GoTo 0
+    End If
+    ws.Cells(r, 3).Value = KindLabel(kind)
+    ApplyRowColor ws, r, kind
+End Sub
 
 Private Function KindLabel(ByVal kind As String) As String
     Select Case kind
         Case "PERFORM": KindLabel = "PERFORM(in)"
+        Case "PARA":    KindLabel = "PARA"
+        Case "CYCLE":   KindLabel = "再帰"
         Case "ERROR":   KindLabel = ChrW(&H2605) & "ERROR"
         Case Else:      KindLabel = kind
     End Select
@@ -421,9 +567,11 @@ Private Sub ApplyRowColor(ByVal ws As Worksheet, ByVal r As Long, ByVal kind As 
     Dim rng As Range: Set rng = ws.Range(ws.Cells(r, 1), ws.Cells(r, 3))
     Select Case kind
         Case "SECTION": rng.Interior.Color = C_SECTION: ws.Cells(r, 1).Font.Bold = True
+        Case "PARA":    rng.Interior.Color = C_SECTION
         Case "IF", "EVALUATE", "SEARCH", "WHEN", "BRANCH", "PERFORM"
             rng.Interior.Color = C_BRANCH
-        Case "ERROR": rng.Interior.Color = RGB(255, 199, 206): ws.Cells(r, 1).Font.Bold = True
+        Case "CYCLE":   rng.Interior.Color = C_WARN
+        Case "ERROR":   rng.Interior.Color = RGB(255, 199, 206): ws.Cells(r, 1).Font.Bold = True
     End Select
 End Sub
 
@@ -471,15 +619,13 @@ Private Function IsInlinePerform(ByVal code As String) As Boolean
     End Select
 End Function
 
-' --- 段落/SECTION ヘッダ判定 (ピリオド付き原文で呼ぶ) ---
-Private Function IsParagraphHeader(ByVal raw As String, ByVal code As String) As Boolean
+' --- ヘッダ判定: "SECTION" / "PARA" / "" (非ヘッダ)。ピリオド付き原文で呼ぶ ---
+Private Function HeaderKind(ByVal raw As String, ByVal code As String) As String
     Dim u As String: u = UCase(Trim(code))
     If Right(u, 1) <> "." Then Exit Function
     Dim body As String: body = Trim(Left(u, Len(u) - 1))   ' ピリオド除去
     ' SECTION ヘッダは列位置に依存せず内容で判定 (環境/桁ズレに強い)
-    If body = "SECTION" Or Right(body, 8) = " SECTION" Then
-        IsParagraphHeader = True: Exit Function
-    End If
+    If body = "SECTION" Or Right(body, 8) = " SECTION" Then HeaderKind = "SECTION": Exit Function
     ' 段落 (bare name) は Area A (8～11桁) 始まりのみ
     Dim col As Long: col = FirstNonSpaceCol(raw, CODE_START)
     If col < CODE_START Or col > 11 Then Exit Function
@@ -490,8 +636,8 @@ Private Function IsParagraphHeader(ByVal raw As String, ByVal code As String) As
              "COMPUTE", "ADD", "SUBTRACT", "MULTIPLY", "DIVIDE", "STRING", "UNSTRING", _
              "INSPECT", "SET", "GO", "GOBACK", "EXIT", "CONTINUE", "INITIALIZE", _
              "READ", "WRITE", "OPEN", "CLOSE", "ACCEPT", "DISPLAY", "THEN", "STOP"
-            IsParagraphHeader = False
-        Case Else: IsParagraphHeader = True
+            ' 動詞 → 非ヘッダ ("" のまま)
+        Case Else: HeaderKind = "PARA"
     End Select
 End Function
 
